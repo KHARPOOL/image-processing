@@ -1,0 +1,2058 @@
+#테스트용
+
+/*
+ * Copyright (c) 2012-2013, NVIDIA CORPORATION. All rights reserved.
+ * All information contained herein is proprietary and confidential to NVIDIA
+ * Corporation.  Any use, reproduction, or disclosure without the written
+ * permission of NVIDIA Corporation is prohibited.
+ */
+  
+// edited by Hyundai Autron
+// gcc -I. -I./utils `pkg-config opencv --cflags` -I./include  -c -o captureOpenCV.o captureOpenCV.c
+// gcc -I. -I./utils `pkg-config opencv --cflags` -I./include  -c -o nvthread.o nvthread.c
+// gcc  -o captureOpenCV captureOpenCV.o nvthread.o  -L ./utils -lnvmedia -lnvtestutil_board -lnvtestutil_capture_input -lnvtestutil_i2c -lpthread `pkg-config opencv --libs`
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <sys/time.h>
+  
+#include <nvcommon.h>
+#include <nvmedia.h>
+  
+#include <testutil_board.h>
+#include <testutil_capture_input.h>
+  
+#include "nvthread.h"
+  
+#include <highgui.h>
+#include <cv.h>
+#include <ResTable_720To320.h>
+#include <pthread.h>
+#include <unistd.h>
+  
+#define VIP_BUFFER_SIZE 6
+#define VIP_FRAME_TIMEOUT_MS 100
+#define VIP_NAME "vip"
+  
+#define MESSAGE_PRINTF printf
+  
+#define CRC32_POLYNOMIAL 0xEDB88320L
+  
+#define RESIZE_WIDTH  320
+#define RESIZE_HEIGHT 240
+  
+
+
+#include <time.h>   
+#include "car_lib.h"
+#include "starting.h"
+#include "parking.h"
+
+#define abs(x) ((x >= 0)? x : -x)
+
+
+
+
+enum psd_channel_definition {
+	FRONT = 1,
+	RIGHT_FRONT,
+	RIGHT_REAR,
+	REAR,
+	LEFT_REAR,
+	LEFT_FRONT,
+};
+
+void *ControlThread(void *unused);
+int Emergency_stop();
+void Line_stop();
+
+ 
+static NvMediaVideoSurface *capSurf = NULL;
+  
+pthread_cond_t      cond  = PTHREAD_COND_INITIALIZER;
+pthread_mutex_t     mutex = PTHREAD_MUTEX_INITIALIZER;
+  
+int table_298[256];
+int table_409[256];
+int table_100[256];
+int table_208[256];
+int table_516[256];
+  
+typedef struct
+{
+    I2cId i2cDevice;
+    
+    CaptureInputDeviceId vipDeviceInUse;
+    NvMediaVideoCaptureInterfaceFormat vipInputtVideoStd;
+    unsigned int vipInputWidth;
+    unsigned int vipInputHeight;
+    float vipAspectRatio;
+  
+    unsigned int vipMixerWidth;
+    unsigned int vipMixerHeight;
+  
+    NvBool vipDisplayEnabled;
+    NvMediaVideoOutputType vipOutputType;
+    NvMediaVideoOutputDevice vipOutputDevice[2];
+    NvBool vipFileDumpEnabled;
+    char * vipOutputFileName;
+  
+    unsigned int vipCaptureTime;
+    unsigned int vipCaptureCount;
+} TestArgs;
+  
+typedef struct
+{
+    NvMediaVideoSurface *surf;
+    NvBool last;
+} QueueElem;
+  
+typedef struct
+{
+    char *name;
+  
+    NvSemaphore *semStart, *semDone;
+  
+    NvMediaVideoCapture *capture;
+    NvMediaVideoMixer *mixer;
+    FILE *fout;
+  
+    unsigned int inputWidth;
+    unsigned int inputHeight;
+  
+    unsigned int timeout;
+  
+    NvBool displayEnabled;
+    NvBool fileDumpEnabled;
+  
+    NvBool timeNotCount;
+    unsigned int last;
+} CaptureContext;
+  
+static NvBool stop = NVMEDIA_FALSE;
+  
+static void SignalHandler(int signal)
+{
+    stop = NVMEDIA_TRUE;
+    MESSAGE_PRINTF("%d signal received\n", signal);
+}
+  
+static void GetTime(NvMediaTime *time)
+{
+    struct timeval t;
+  
+    gettimeofday(&t, NULL);
+  
+    time->tv_sec = t.tv_sec;
+    time->tv_nsec = t.tv_usec * 1000;
+}
+  
+static void AddTime(NvMediaTime *time, NvU64 uSec, NvMediaTime *res)
+{
+    NvU64 t, newTime;
+  
+    t = (NvU64)time->tv_sec * 1000000000LL + (NvU64)time->tv_nsec;
+    newTime = t + uSec * 1000LL;
+    res->tv_sec = newTime / 1000000000LL;
+    res->tv_nsec = newTime % 1000000000LL;
+}
+  
+static NvBool SubTime(NvMediaTime *time1, NvMediaTime *time2)
+{
+    NvS64 t1, t2, delta;
+  
+    t1 = (NvS64)time1->tv_sec * 1000000000LL + (NvS64)time1->tv_nsec;
+    t2 = (NvS64)time2->tv_sec * 1000000000LL + (NvS64)time2->tv_nsec;
+    delta = t1 - t2;
+  
+    return delta > 0LL;
+}
+  
+  
+static void DisplayUsage(void)
+{
+    printf("Usage : nvmedia_capture [options]\n");
+    printf("Brief: Displays this help if no arguments are given. Engages the respective capture module whenever a single \'c\' or \'v\' argument is supplied using default values for the missing parameters.\n");
+    printf("Options:\n");
+    printf("-va <aspect ratio>    VIP aspect ratio (default = 1.78 (16:9))\n");
+    printf("-vmr <width>x<height> VIP mixer resolution (default 800x480)\n");
+    printf("-vf <file name>       VIP output file name; default = off\n");
+    printf("-vt [seconds]         VIP capture duration (default = 10 secs); overridden by -vn; default = off\n");
+    printf("-vn [frames]          # VIP frames to be captured (default = 300); default = on if -vt is not used\n");
+}
+  
+static int ParseOptions(int argc, char *argv[], TestArgs *args)
+{
+    int i = 1;
+  
+    args->i2cDevice = I2C4;   
+  
+    args->vipDeviceInUse = AnalogDevices_ADV7182;
+    args->vipInputtVideoStd = NVMEDIA_VIDEO_CAPTURE_INTERFACE_FORMAT_VIP_NTSC;
+    args->vipInputWidth = 720;
+    args->vipInputHeight = 480;
+    args->vipAspectRatio = 0.0f;
+  
+    args->vipMixerWidth = 800;
+    args->vipMixerHeight = 480;
+  
+    args->vipDisplayEnabled = NVMEDIA_FALSE;
+    args->vipOutputType = NvMediaVideoOutputType_OverlayYUV;
+    args->vipOutputDevice[0] = NvMediaVideoOutputDevice_LVDS;
+    args->vipFileDumpEnabled = NVMEDIA_FALSE;
+    args->vipOutputFileName = NULL;
+  
+    args->vipCaptureTime = 0;
+    args->vipCaptureCount = 0;
+  
+    
+  
+    if(i < argc && argv[i][0] == '-')
+    {
+        while(i < argc && argv[i][0] == '-')
+        {
+            if(i > 1 && argv[i][1] == '-')
+            {
+                MESSAGE_PRINTF("Using basic and custom options together is not supported\n");
+                return 0;
+            }
+  
+            if(!strcmp(argv[i], "-va"))
+            {
+                if(++i < argc)
+                {
+                    if(sscanf(argv[i], "%f", &args->vipAspectRatio) != 1 || args->vipAspectRatio <= 0.0f)
+                    {
+                        MESSAGE_PRINTF("Bad VIP aspect ratio: %s\n", argv[i]);
+                        return 0;
+                    }
+                }
+                else
+                {
+                    MESSAGE_PRINTF("Missing VIP aspect ratio\n");
+                    return 0;
+                }
+            }
+            else if(!strcmp(argv[i], "-vmr"))
+            {
+                if(++i < argc)
+                {
+                    if(sscanf(argv[i], "%ux%u", &args->vipMixerWidth, &args->vipMixerHeight) != 2)
+                    {
+                        MESSAGE_PRINTF("Bad VIP mixer resolution: %s\n", argv[i]);
+                        return 0;
+                    }
+                }
+                else
+                {
+                    MESSAGE_PRINTF("Missing VIP mixer resolution\n");
+                    return 0;
+                }
+            }
+            else if(!strcmp(argv[i], "-vf"))
+            {
+                args->vipFileDumpEnabled = NVMEDIA_TRUE;
+                if(++i < argc)
+                    args->vipOutputFileName = argv[i];
+                else
+                {
+                    MESSAGE_PRINTF("Missing VIP output file name\n");
+                    return 0;
+                }
+            }
+            else if(!strcmp(argv[i], "-vt"))
+            {
+                if(++i < argc)
+                    if(sscanf(argv[i], "%u", &args->vipCaptureTime) != 1)
+                    {
+                        MESSAGE_PRINTF("Bad VIP capture duration: %s\n", argv[i]);
+                        return 0;
+                    }
+            }
+            else if(!strcmp(argv[i], "-vn"))
+            {
+                if(++i < argc)
+                    if(sscanf(argv[i], "%u", &args->vipCaptureCount) != 1)
+                    {
+                        MESSAGE_PRINTF("Bad VIP capture count: %s\n", argv[i]);
+                        return 0;
+                    }
+            }
+            else
+            {
+                MESSAGE_PRINTF("%s is not a supported option\n", argv[i]);
+                return 0;
+            }
+  
+            i++;
+        }
+    }
+  
+    if(i < argc)
+    {
+        MESSAGE_PRINTF("%s is not a supported option\n", argv[i]);
+        return 0;
+    }
+  
+    if(i < 2)
+    {
+        DisplayUsage();
+        return 0;
+    }
+  
+  
+    if(args->vipAspectRatio == 0.0f)
+        args->vipAspectRatio = 1.78f;
+  
+    if(!args->vipDisplayEnabled && !args->vipFileDumpEnabled)
+        args->vipDisplayEnabled = NVMEDIA_TRUE;
+  
+  
+    if(!args->vipCaptureTime && !args->vipCaptureCount)
+        args->vipCaptureCount = 300;
+    else if(args->vipCaptureTime && args->vipCaptureCount)
+        args->vipCaptureTime = 0;
+  
+  
+  
+    return 1;
+}
+  
+static int DumpFrame(FILE *fout, NvMediaVideoSurface *surf)
+{
+    NvMediaVideoSurfaceMap surfMap;
+    unsigned int width, height;
+  
+    if(NvMediaVideoSurfaceLock(surf, &surfMap) != NVMEDIA_STATUS_OK)
+    {
+        MESSAGE_PRINTF("NvMediaVideoSurfaceLock() failed in DumpFrame()\n");
+        return 0;
+    }
+  
+    width = surf->width;
+    height = surf->height;
+  
+    unsigned char *pY[2] = {surfMap.pY, surfMap.pY2};
+    unsigned char *pU[2] = {surfMap.pU, surfMap.pU2};
+    unsigned char *pV[2] = {surfMap.pV, surfMap.pV2};
+    unsigned int pitchY[2] = {surfMap.pitchY, surfMap.pitchY2};
+    unsigned int pitchU[2] = {surfMap.pitchU, surfMap.pitchU2};
+    unsigned int pitchV[2] = {surfMap.pitchV, surfMap.pitchV2};
+    unsigned int i, j;
+  
+    for(i = 0; i < 2; i++)
+    {
+        for(j = 0; j < height / 2; j++)
+        {
+            fwrite(pY[i], width, 1, fout);
+            pY[i] += pitchY[i];
+        }
+        for(j = 0; j < height / 2; j++)
+        {
+            fwrite(pU[i], width / 2, 1, fout);
+            pU[i] += pitchU[i];
+        }
+        for(j = 0; j < height / 2; j++)
+        {
+           fwrite(pV[i], width / 2, 1, fout);
+           pV[i] += pitchV[i];
+        }
+    }
+  
+  
+    NvMediaVideoSurfaceUnlock(surf);
+  
+    return 1;
+}
+  
+static void CheckDisplayDevice(NvMediaVideoOutputDevice deviceType, NvMediaBool *enabled, unsigned int *displayId)
+{
+    int outputDevices;
+    NvMediaVideoOutputDeviceParams *outputParams;
+    int i;
+  
+    *enabled = NVMEDIA_FALSE;
+    *displayId = 0;
+  
+    if(NvMediaVideoOutputDevicesQuery(&outputDevices, NULL) != NVMEDIA_STATUS_OK) {
+        return;
+    }
+  
+    outputParams = malloc(outputDevices * sizeof(NvMediaVideoOutputDeviceParams));
+    if(!outputParams) {
+        return;
+    }
+  
+    if(NvMediaVideoOutputDevicesQuery(&outputDevices, outputParams) != NVMEDIA_STATUS_OK) {
+        free(outputParams);
+        return;
+    }
+  
+    for(i = 0; i < outputDevices; i++) {
+        if((outputParams + i)->outputDevice == deviceType) {
+            *enabled = (outputParams + i)->enabled;
+            *displayId = (outputParams + i)->displayId;
+            break;
+        }
+    }
+  
+    free(outputParams);
+}
+
+int emerg_red = 0;
+
+static int Frame2Ipl(IplImage* img)
+{
+    NvMediaVideoSurfaceMap surfMap;
+    unsigned int resWidth, resHeight;
+    int r,g,b;
+    unsigned char y,u,v;
+    int num;
+  
+    if(NvMediaVideoSurfaceLock(capSurf, &surfMap) != NVMEDIA_STATUS_OK)
+    {
+        MESSAGE_PRINTF("NvMediaVideoSurfaceLock() failed in Frame2Ipl()\n");
+        return 0;
+    }
+  
+    unsigned char *pY[2] = {surfMap.pY, surfMap.pY2};
+    unsigned char *pU[2] = {surfMap.pU, surfMap.pU2};
+    unsigned char *pV[2] = {surfMap.pV, surfMap.pV2};
+    unsigned int pitchY[2] = {surfMap.pitchY, surfMap.pitchY2};
+    unsigned int pitchU[2] = {surfMap.pitchU, surfMap.pitchU2};
+    unsigned int pitchV[2] = {surfMap.pitchV, surfMap.pitchV2};
+    unsigned int i, j, k, x;
+    unsigned int stepY, stepU, stepV;
+      
+    resWidth = RESIZE_WIDTH;
+    resHeight = RESIZE_HEIGHT;
+      
+    img->nSize = 112;
+    img->ID = 0;
+    img->nChannels = 3;
+    img->alphaChannel = 0;
+    img->depth = IPL_DEPTH_8U;    
+    img->colorModel[0] = 'R';
+    img->colorModel[1] = 'G';
+    img->colorModel[2] = 'B';
+    img->channelSeq[0] = 'B';
+    img->channelSeq[1] = 'G';
+    img->channelSeq[2] = 'R';
+    img->dataOrder = 0;
+    img->origin = 0;
+    img->align = 4;
+    img->width = resWidth;
+    img->height = resHeight;
+    img->imageSize = resHeight*resWidth*3;
+    img->widthStep = resWidth*3;
+    img->BorderMode[0] = 0;
+    img->BorderMode[1] = 0;
+    img->BorderMode[2] = 0;
+    img->BorderMode[3] = 0;
+    img->BorderConst[0] = 0;
+    img->BorderConst[1] = 0;
+    img->BorderConst[2] = 0;
+    img->BorderConst[3] = 0;
+      
+    stepY = 0;
+    stepU = 0;
+    stepV = 0;
+    i = 0;
+    
+	emerg_red = 0;
+    for(j = 0; j < resHeight; j++)
+    {
+        for(k = 0; k < resWidth; k++)
+        {
+            x = ResTableX_720To320[k];
+            y = pY[i][stepY+x];
+            u = pU[i][stepU+x/2];
+            v = pV[i][stepV+x/2];
+              
+            r = y + 1.4075*(v-128);
+            g = y - 0.34455*(u-128) - 0.7169*(v-128);
+            b = y + 1.779*(u-128);
+  
+  
+            r = r>255? 255 : r<0 ? 0 : r;
+            g = g>255? 255 : g<0 ? 0 : g;
+            b = b>255? 255 : b<0 ? 0 : b;
+            
+  
+            num = 3*k+3*resWidth*(j);
+        
+        	img->imageData[num] = b;
+          img->imageData[num+1] = g;
+          img->imageData[num+2] = r;  
+            
+        }
+        
+        
+        
+        stepY += pitchY[i];
+        stepU += pitchU[i];
+        stepV += pitchV[i];
+    }
+       
+      
+    NvMediaVideoSurfaceUnlock(capSurf);
+  
+    return 1;
+}
+  
+static unsigned int CaptureThread(void *params)
+{
+
+    int i = 0;
+    NvU64 stime, ctime;
+    NvMediaTime t1 = {0}, t2 = {0}, st = {0}, ct = {0};
+    CaptureContext *ctx = (CaptureContext *)params;
+    NvMediaVideoSurface *releaseList[4] = {NULL}, **relList;
+    NvMediaRect primarySrcRect;
+    NvMediaPrimaryVideo primaryVideo;
+  
+    primarySrcRect.x0 = 0;
+    primarySrcRect.y0 = 0;
+    primarySrcRect.x1 = ctx->inputWidth;
+    primarySrcRect.y1 = ctx->inputHeight;
+  
+    primaryVideo.next = NULL;
+    primaryVideo.previous = NULL;
+    primaryVideo.previous2 = NULL;
+    primaryVideo.srcRect = &primarySrcRect;
+    primaryVideo.dstRect = NULL;
+      
+  
+    NvSemaphoreDecrement(ctx->semStart, NV_TIMEOUT_INFINITE);
+  
+    if(ctx->timeNotCount)
+    {
+        GetTime(&t1);
+        AddTime(&t1, ctx->last * 1000000LL, &t1);
+        GetTime(&t2);
+        printf("timeNotCount\n");
+    }
+    GetTime(&st);
+    stime = (NvU64)st.tv_sec * 1000000000LL + (NvU64)st.tv_nsec;
+  
+    while((ctx->timeNotCount? (SubTime(&t1, &t2)): ((unsigned int)i < ctx->last)) && !stop)
+    {
+        GetTime(&ct);
+        ctime = (NvU64)ct.tv_sec * 1000000000LL + (NvU64)ct.tv_nsec;
+  
+        pthread_mutex_lock(&mutex);          
+          
+        if(!(capSurf = NvMediaVideoCaptureGetFrame(ctx->capture, ctx->timeout)))
+        { 
+            MESSAGE_PRINTF("NvMediaVideoCaptureGetFrame() failed in %sThread\n", ctx->name);
+            stop = NVMEDIA_TRUE;
+            break;
+        }
+        
+		
+        if(i%1 == 0)                     
+            pthread_cond_signal(&cond);  
+  
+        pthread_mutex_unlock(&mutex);    
+          
+        primaryVideo.current = capSurf;
+        primaryVideo.pictureStructure = NVMEDIA_PICTURE_STRUCTURE_TOP_FIELD;
+  
+        if(NVMEDIA_STATUS_OK != NvMediaVideoMixerRender(ctx->mixer,
+                                                        NVMEDIA_OUTPUT_DEVICE_0, 
+                                                        NULL, 
+                                                        &primaryVideo, 
+                                                        NULL,
+                                                        NULL,
+                                                        NULL,
+                                                        releaseList,
+                                                        NULL)) 
+        {
+            MESSAGE_PRINTF("NvMediaVideoMixerRender() failed for the top field in %sThread\n", ctx->name);
+            stop = NVMEDIA_TRUE;
+        }
+  
+        primaryVideo.pictureStructure = NVMEDIA_PICTURE_STRUCTURE_BOTTOM_FIELD;
+        if(NVMEDIA_STATUS_OK != NvMediaVideoMixerRender(ctx->mixer,
+                                                        NVMEDIA_OUTPUT_DEVICE_0,
+                                                        NULL, 
+                                                        &primaryVideo, 
+                                                        NULL, 
+                                                        NULL, 
+                                                        NULL, 
+                                                        releaseList, 
+                                                        NULL)) 
+        { 
+            MESSAGE_PRINTF("NvMediaVideoMixerRender() failed for the bottom field in %sThread\n", ctx->name);
+            stop = NVMEDIA_TRUE;
+        }
+  
+        if(ctx->fileDumpEnabled)
+        {
+            if(!DumpFrame(ctx->fout, capSurf))
+            { 
+                MESSAGE_PRINTF("DumpFrame() failed in %sThread\n", ctx->name);
+                stop = NVMEDIA_TRUE;
+            }
+  
+            if(!ctx->displayEnabled)
+                releaseList[0] = capSurf;
+        }
+          
+        relList = &releaseList[0];
+  
+        while(*relList)
+        {
+            if(NvMediaVideoCaptureReturnFrame(ctx->capture, *relList) != NVMEDIA_STATUS_OK)
+            { 
+                MESSAGE_PRINTF("NvMediaVideoCaptureReturnFrame() failed in %sThread\n", ctx->name);
+                stop = NVMEDIA_TRUE;
+                break;
+            }
+            relList++;
+        }
+  
+        if(ctx->timeNotCount)
+            GetTime(&t2);
+  
+        i++;
+    } 
+  
+    if(ctx->displayEnabled && capSurf)
+    {
+        NvMediaVideoMixerRender(ctx->mixer, 
+                                NVMEDIA_OUTPUT_DEVICE_0, 
+                                NULL, 
+                                NULL, 
+                                NULL, 
+                                NULL, 
+                                NULL, 
+                                releaseList, 
+                                NULL);
+  
+        relList = &releaseList[0];
+  
+        while(*relList)
+        {
+            if(NvMediaVideoCaptureReturnFrame(ctx->capture, *relList) != NVMEDIA_STATUS_OK)
+                MESSAGE_PRINTF("NvMediaVideoCaptureReturnFrame() failed in %sThread\n", ctx->name);
+  
+            relList++;
+        }
+    }
+  
+    NvSemaphoreIncrement(ctx->semDone);
+    return 0;
+}
+
+
+int main(int argc, char *argv[])
+{
+	
+	
+    int err = -1;
+    TestArgs testArgs;
+  
+    CaptureInputHandle handle;
+  
+    NvMediaVideoCapture *vipCapture = NULL;
+    NvMediaDevice *device = NULL;
+    NvMediaVideoMixer *vipMixer = NULL;
+    NvMediaVideoOutput *vipOutput[2] = {NULL, NULL};
+    NvMediaVideoOutput *nullOutputList[1] = {NULL};
+    FILE *vipFile = NULL;
+  
+    NvSemaphore *vipStartSem = NULL, *vipDoneSem = NULL;
+    NvThread *vipThread = NULL;
+  
+    CaptureContext vipCtx;
+    NvMediaBool deviceEnabled = NVMEDIA_FALSE;
+    unsigned int displayId;
+      
+    pthread_t cntThread;
+      
+    signal(SIGINT, SignalHandler);
+  
+    memset(&testArgs, 0, sizeof(TestArgs));
+    if(!ParseOptions(argc, argv, &testArgs))
+        return -1;
+  
+    printf("1. Create NvMedia capture \n");
+    switch (testArgs.vipDeviceInUse)
+    {
+        case AnalogDevices_ADV7180:
+            break;
+        case AnalogDevices_ADV7182:
+        {
+            CaptureInputConfigParams params;
+  
+            params.width = testArgs.vipInputWidth; 
+            params.height = testArgs.vipInputHeight; 
+            params.vip.std = testArgs.vipInputtVideoStd;
+  
+            if(testutil_capture_input_open(testArgs.i2cDevice, testArgs.vipDeviceInUse, NVMEDIA_TRUE, &handle) < 0)
+            {
+                MESSAGE_PRINTF("Failed to open VIP device\n");
+                goto fail;
+            }
+  
+            if(testutil_capture_input_configure(handle, &params) < 0)
+            {
+                MESSAGE_PRINTF("Failed to configure VIP device\n");
+                goto fail;
+            }
+  
+            break;
+        }
+        default:
+            MESSAGE_PRINTF("Bad VIP device\n");
+            goto fail;
+    }
+      
+  
+    if(!(vipCapture = NvMediaVideoCaptureCreate(testArgs.vipInputtVideoStd,
+                                                NULL, 
+                                                VIP_BUFFER_SIZE)))
+    {
+        MESSAGE_PRINTF("NvMediaVideoCaptureCreate() failed for vipCapture\n");
+        goto fail;
+    }
+    
+  
+    printf("2. Create NvMedia device \n");
+    if(!(device = NvMediaDeviceCreate()))
+    {
+        MESSAGE_PRINTF("NvMediaDeviceCreate() failed\n");
+        goto fail;
+    }
+  
+    printf("3. Create NvMedia mixer(s) and output(s) and bind them \n");
+    
+    unsigned int features = 0;
+  
+  
+    features |= NVMEDIA_VIDEO_MIXER_FEATURE_VIDEO_SURFACE_TYPE_YV16X2;
+    features |= NVMEDIA_VIDEO_MIXER_FEATURE_PRIMARY_VIDEO_DEINTERLACING; 
+    if(testArgs.vipOutputType != NvMediaVideoOutputType_OverlayYUV)
+        features |= NVMEDIA_VIDEO_MIXER_FEATURE_DVD_MIXING_MODE;
+  
+    if(!(vipMixer = NvMediaVideoMixerCreate(device, 
+                                            testArgs.vipMixerWidth, 
+                                            testArgs.vipMixerHeight, 
+                                            testArgs.vipAspectRatio, 
+                                            testArgs.vipInputWidth, 
+                                            testArgs.vipInputHeight, 
+                                            0, 
+                                            0, 
+                                            0, 
+                                            0, 
+                                            0, 
+                                            0, 
+                                            features , 
+                                            nullOutputList))) 
+    {
+        MESSAGE_PRINTF("NvMediaVideoMixerCreate() failed for vipMixer\n");
+        goto fail;
+    }
+  
+    printf("4. Check that the device is enabled (initialized) \n");
+   
+    CheckDisplayDevice(
+        testArgs.vipOutputDevice[0],
+        &deviceEnabled,
+        &displayId);
+  
+    if((vipOutput[0] = NvMediaVideoOutputCreate(testArgs.vipOutputType, 
+                                                testArgs.vipOutputDevice[0], 
+                                                NULL, 
+                                                deviceEnabled, 
+                                                displayId, 
+                                                NULL))) 
+    {
+        if(NvMediaVideoMixerBindOutput(vipMixer, vipOutput[0], NVMEDIA_OUTPUT_DEVICE_0) != NVMEDIA_STATUS_OK)
+        {
+            MESSAGE_PRINTF("Failed to bind VIP output to mixer\n");
+            goto fail;
+        }
+    }
+    else
+    {
+        MESSAGE_PRINTF("NvMediaVideoOutputCreate() failed for vipOutput\n");
+        goto fail;
+    }
+  
+   
+  
+    printf("5. Open output file(s) \n");
+ 
+    if(testArgs.vipFileDumpEnabled)
+    {
+        vipFile = fopen(testArgs.vipOutputFileName, "w");
+        if(!vipFile || ferror(vipFile))
+        {
+            MESSAGE_PRINTF("Error opening output file for VIP\n");
+            goto fail;
+        }
+    }
+  
+    printf("6. Create vip pool(s), queue(s), fetch threads and stream start/done semaphores \n");
+    if(NvSemaphoreCreate(&vipStartSem, 0, 1) != RESULT_OK)
+    {
+        MESSAGE_PRINTF("NvSemaphoreCreate() failed for vipStartSem\n");
+        goto fail;
+    }
+  
+    if(NvSemaphoreCreate(&vipDoneSem, 0, 1) != RESULT_OK)
+    {
+        MESSAGE_PRINTF("NvSemaphoreCreate() failed for vipDoneSem\n");
+        goto fail;
+    }
+  
+    vipCtx.name = VIP_NAME;
+  
+    vipCtx.semStart = vipStartSem;
+    vipCtx.semDone = vipDoneSem;
+  
+    vipCtx.capture = vipCapture;
+    vipCtx.mixer = vipMixer;
+    vipCtx.fout = vipFile;
+  
+    vipCtx.inputWidth = testArgs.vipInputWidth;
+    vipCtx.inputHeight = testArgs.vipInputHeight;
+  
+    vipCtx.timeout = VIP_FRAME_TIMEOUT_MS;
+  
+    vipCtx.displayEnabled = testArgs.vipDisplayEnabled;
+    vipCtx.fileDumpEnabled = testArgs.vipFileDumpEnabled;
+  
+    if(testArgs.vipCaptureTime)
+    {
+        vipCtx.timeNotCount = NVMEDIA_TRUE;
+        vipCtx.last = testArgs.vipCaptureTime;
+    }
+    else
+    {
+        vipCtx.timeNotCount = NVMEDIA_FALSE;
+        vipCtx.last = testArgs.vipCaptureCount;
+    }
+  
+  
+    if(NvThreadCreate(&vipThread, CaptureThread, &vipCtx, NV_THREAD_PRIORITY_NORMAL) != RESULT_OK)
+    {
+        MESSAGE_PRINTF("NvThreadCreate() failed for vipThread\n");
+        goto fail;
+    }
+  
+    printf("wait for ADV7182 ... one second\n");
+    sleep(1);
+      
+    printf("7. Kickoff \n");
+    NvMediaVideoCaptureStart(vipCapture);
+    NvSemaphoreIncrement(vipStartSem);
+      
+    printf("8. Control Thread\n");
+    pthread_create(&cntThread, NULL, &ControlThread, NULL);
+  
+    printf("9. Wait for completion \n");
+    NvSemaphoreDecrement(vipDoneSem, NV_TIMEOUT_INFINITE);
+  
+  
+    err = 0;
+  
+fail: 
+    if(vipThread)
+        NvThreadDestroy(vipThread);
+    if(vipDoneSem)
+        NvSemaphoreDestroy(vipDoneSem);
+    if(vipStartSem)
+        NvSemaphoreDestroy(vipStartSem);
+  
+    printf("10. Close output file(s)! \n");
+    
+    if(vipFile)
+        fclose(vipFile);
+          
+    
+    if(vipOutput[0])
+    {
+        NvMediaVideoMixerUnbindOutput(vipMixer, vipOutput[0], NULL);
+        NvMediaVideoOutputDestroy(vipOutput[0]);
+    }
+    if(vipOutput[1])
+    {
+        NvMediaVideoMixerUnbindOutput(vipMixer, vipOutput[1], NULL);
+        NvMediaVideoOutputDestroy(vipOutput[1]);
+    }
+    if(vipMixer)
+        NvMediaVideoMixerDestroy(vipMixer);
+  
+  
+    
+    if(device)
+        NvMediaDeviceDestroy(device);
+  
+   
+    if(vipCapture)
+    {
+        NvMediaVideoCaptureDestroy(vipCapture);
+  
+        
+        switch (testArgs.vipDeviceInUse)
+        {
+            case AnalogDevices_ADV7180: 
+                break;
+            case AnalogDevices_ADV7182: 
+                break;
+            default:
+                break;
+        }
+    } 
+      
+       
+    
+    Finishing();
+    
+    
+    return err;
+} 
+
+IplImage *imgOrigin, *imgBW, *imgBi, *imgPrev, *imgSub, *imgYellow, *imgCanny, *imgGray;
+uchar *data;
+const int width = RESIZE_WIDTH, height = RESIZE_HEIGHT;
+int frame_cnt = 0;
+int rotary_state = 0;
+int yellow_flag = 0;
+int obstacle_flag = 0;
+int lane_end = 0;
+
+bool Waiting_start_sign()
+{
+	int sum = 0;
+	int i, j; 
+	
+	for(i=0;i<height;i++){
+		for(j=0;j<width;j++){
+			imgBW->imageData[i*width+j] = (data[3*i*width+3*j]+data[3*i*width+3*j+1]+data[3*i*width+3*j+2]) / 3;
+		}
+	}
+	
+    if(frame_cnt > 0){
+		cvSub(imgBW, imgPrev, imgSub, NULL);
+		for(i=0; i<height; i++){
+			for(j=0; j<width; j++){
+				sum += imgSub->imageData[i*width+j];
+			}
+		}
+	}
+	
+	if(sum > 2000000) return true;
+           
+	cvCopy(imgBW, imgPrev, NULL);
+	return false;
+}
+
+void Traffic_light_start()
+{
+	
+	DesireSpeed_Write(0);
+	sleep(1);
+	CameraYServoControl_Write(1500);
+	sleep(1);
+	Alarm_Write(ON);
+	sleep(1);
+	Alarm_Write(OFF);	
+	mission_flag = TRAFFIC_LIGHT;
+}
+
+enum{
+	BEFORE_LIGHT,
+	AFTER_LIGHT,
+	STOP_AREA
+} final_tracing_state;
+
+
+#define NUM_OF_MISSION 5
+
+int rotary_start_enco;
+bool line_stop_on = true;
+unsigned char line_accum = 0x7f;
+int line_tick;
+void Line_stop(void)
+{
+		unsigned char sens = LineSensor_Read();
+		unsigned int i;
+		unsigned int cnt = 0;
+		for(i=0;i<7;i++) {
+			cnt += 0x01&(sens >>i);
+		}
+		if(cnt <= 3 && line_stop_on && mission_flag != HILL) {
+			line_stop_on = false;
+			DesireSpeed_Write(0);
+			
+			if(mission_flag == BEFORE_TRAFFIC_LIGHT) {
+				CarLight_Write(ALL_OFF);
+		        mission_check[TRAFFIC_LIGHT] = true;
+		        SteeringServoControl_Write(STEERING_CENTER);
+		        mission_flag = TRAFFIC_LIGHT;
+		        Traffic_light_start();
+		    }
+		    else if(mission_flag == AFTER_JUDGING_TRAFFIC_LIGHT){
+		        final_tracing_state = STOP_AREA;
+		    }
+		    else if(!mission_check[ROTARY]) {
+				mission_flag = ROTARY;
+				EncoderCounter_Write(0);
+				rotary_start_enco = EncoderCounter_Read();
+			}
+		}
+}
+
+
+
+unsigned int psd_cnt = 0;
+float pre_psd_dist = 30.0f;
+void Three_lane_detect()
+{
+	float temp = 0;
+	if(Distance_Channel(FRONT) <= 0.40f) {
+		psd_cnt ++;
+	}
+	else {
+		psd_cnt = 0;
+	}
+	
+	printf("psd_cnt=%d",psd_cnt);
+
+	if ((psd_cnt >= 2) && (Distance_Channel(FRONT) <= 0.20f)) {
+		DesireSpeed_Write(0);
+		obstacle_flag = 1;
+		psd_cnt = 0;
+	}
+	
+	if(lane_end > 1) yellow_flag = 1;
+			
+	if(yellow_flag == 1){
+		SteeringServoControl_Write(1500);
+		
+		GoDistance(-0.30f);
+		SteeringServoControl_Write(1900);
+		usleep(300000);
+		GoDistance(0.42f);
+		SteeringServoControl_Write(1100);    
+		usleep(300000);
+		GoDistance(0.20f);
+		DesireSpeed_Write(DEFAULT_SPEED);
+		mission_flag = BEFORE_TRAFFIC_LIGHT;
+		mission_check[THREE_LANE] = true;
+		flag_cnt++;	
+	}
+			
+}
+
+void Refresh_BW(int bw_threshold)
+{
+    int i, j;
+    for (i = 0; i < height; i++) {
+        for (j = 0; j < width; j++) {
+            imgBi->imageData[i*width + j] = ((data[3*i*width + 3*j] + data[3*i*width + 3*j + 1] + data[3*i*width+ 3*j + 2]) / 3 >= bw_threshold) ? 255 : 0;
+        }
+    }
+}
+
+int hill_tick;
+enum {
+	NO_HILL,
+	BEFORE_HILL,
+	HILL_CLIMBING,
+	HILL_DESCENDING,
+	HILL_END
+} hill_state;
+
+CvPoint mPoint(CvPoint lPoint, double rad_l, CvPoint rPoint, double rad_r)
+{
+	int xl = lPoint.x, yl = lPoint.y, xr = rPoint.x, yr = rPoint.y;
+	int x = (rad_l*xl-rad_r*xr-yl+yr)/(rad_l-rad_r) + 0.5;
+	int y = rad_l*(rad_r*(xl-xr)-yl+yr)/(rad_l-rad_r) + yl + 0.5;
+	return cvPoint(x, y);
+}
+
+const double small_angle = 0.5, big_angle = 0.6;
+int rotary_out_state;
+int rotary_out_tick;
+void Rotary_out(double angle)
+{
+	if(rotary_out_state == 0) {
+		rotary_out_tick = EncoderCounter_Read();
+		rotary_out_state = 1;
+	} else if(rotary_out_state == 1) {
+		if(angle < small_angle) rotary_out_state = 2;
+	} else if(rotary_out_state == 2) {
+		if(angle > big_angle) {
+			rotary_out_state = 3;
+			rotary_state = 2;
+		}
+	}
+}
+
+enum {RIGHT, LEFT} traffic_flag;
+
+const int nThreshold = 50, nParam1 = 40, nParam2 = 5; 
+const int hill_y = 65; 
+const double b_ratio = 12.0; 
+const int yl = 140; 
+const int cut_y = 180; 
+const int bot_y = 270; 
+int last_angle = STEERING_CENTER;
+
+void Line_tracing(void)
+{
+	int i, j;
+	
+	if(mission_flag != ROTARY && mission_flag != HILL) {
+		Line_stop();
+	}
+	
+	for (i = 0; i<height; i++) {
+		for (j = 0; j<width; j++) {
+			imgYellow->imageData[i*width + j] = (data[3*i*width + 3*j] * 1.8 < data[3*i*width + 3*j + 1] && data[3*i*width +3*j] * 1.8 < data[3*i*width + 3*j + 2]) ? 255 : 0;
+		}
+	}
+	CvMemStorage *storage = cvCreateMemStorage(0);
+	CvSeq *lines = 0;
+	lines = cvHoughLines2(imgYellow, storage, CV_HOUGH_PROBABILISTIC, 1, CV_PI / 180, nThreshold, nParam1, nParam2);
+	CvPoint *line;
+	CvPoint pt1, pt2;
+
+	int left_line_cnt = 0, right_line_cnt = 0;
+	double avg_xl = 0, avg_xr = width, sum_xl = 0, sum_xr = 0;
+	int cnt_rad = 0; double sum_rad = 0;
+	int left_sum_x = 0, right_sum_x = 0, left_avg_x = 0, right_avg_x = width;
+	int left_sum_y = 0, right_sum_y = 0, left_avg_y = 0, right_avg_y = 0;
+	double left_sum_rad = 0, right_sum_rad = 0, left_avg_rad = -((small_angle + big_angle) / 2), right_avg_rad = (small_angle + big_angle) / 2;
+	int sum_y = 0; double avg_y;
+	int top_y = 0;
+	
+	lane_end = 0;
+	for (i = 0; i<lines->total; i++) {
+		line = (CvPoint*)cvGetSeqElem(lines, i);
+
+		pt1 = line[0];
+		pt2 = line[1];
+
+		double rad = atan2((double)pt2.y - pt1.y, (double)pt2.x - pt1.x);
+		
+		if(mission_flag == THREE_LANE || mission_flag == BEFORE_THREE_LANE) {
+			if(pt1.y > 140 && pt2.y > 140 && abs(rad) < 0.15) {
+				lane_end++;
+			}
+		}
+		
+		
+		top_y = (pt1.y < pt2.y)? pt1.y : pt2.y;
+		if(top_y < hill_y) {
+            cnt_rad++;
+            sum_rad += abs(rad);
+        }
+        
+        sum_y += (pt1.y + pt2.y) / 2;
+        
+        if(abs(rad) >= 0.1) {
+			int by = (pt1.y > pt2.y)? pt1.y : pt2.y;
+			if (pt1.y != pt2.y && by >= yl) {
+				double xl = pt1.x + (cut_y - pt1.y)*(pt2.x - pt1.x) / (double)(pt2.y - pt1.y);
+				double xb = pt1.x + (bot_y - pt1.y)*(pt2.x - pt1.x) / (double)(pt2.y - pt1.y);
+				if (xb < width / 2 && rad < 0){
+					left_line_cnt++;
+					sum_xl += xl;
+					left_sum_x += (pt1.x + pt2.x);
+					left_sum_y += (pt1.y + pt2.y);
+					left_sum_rad += rad;
+					cvLine(imgOrigin, cvPoint(pt1.x, pt1.y), cvPoint(pt2.x, pt2.y), CV_RGB(0, 0, 255), 1, 8, 0);
+				}
+				else if (xb >= width / 2 && rad > 0) {
+					right_line_cnt++;
+					sum_xr += xl;
+					right_sum_x += (pt1.x + pt2.x);
+					right_sum_y += (pt1.y + pt2.y);
+					right_sum_rad += rad;
+					cvLine(imgOrigin, cvPoint(pt1.x, pt1.y), cvPoint(pt2.x, pt2.y), CV_RGB(0, 0, 255), 1, 8, 0);
+				}
+				cvLine(imgOrigin, cvPoint(pt1.x, pt1.y), cvPoint(pt2.x, pt2.y), CV_RGB(0, 255, 0), 1, 8, 0);
+			}
+		} 
+		else{cvLine(imgOrigin, cvPoint(pt1.x, pt1.y), cvPoint(pt2.x, pt2.y), CV_RGB(255, 0, 0), 1, 8, 0);}
+	}
+
+	if(left_line_cnt >= 2) {
+		avg_xl = sum_xl / left_line_cnt;
+		left_avg_rad = left_sum_rad / left_line_cnt;
+		left_avg_x = left_sum_x / (double)(left_line_cnt * 2) + 0.5;
+		left_avg_y = left_sum_y / (double)(left_line_cnt * 2) + 0.5;
+	}
+	if(right_line_cnt >= 2) {
+		avg_xr = sum_xr / right_line_cnt;
+		right_avg_rad = right_sum_rad / right_line_cnt;
+		right_avg_x = right_sum_x / (double)(right_line_cnt * 2) + 0.5;
+		right_avg_y = right_sum_y / (double)(right_line_cnt * 2) + 0.5;
+	}
+	
+	
+	CvPoint mid_pt;
+	mid_pt.x = width/2; mid_pt.y = 0;
+	if(left_line_cnt >= 2 && right_line_cnt >= 2) {
+	
+		mid_pt = mPoint(cvPoint(left_avg_x, left_avg_y), left_avg_rad, cvPoint(right_avg_x, right_avg_y), right_avg_rad);
+	}
+	
+	if(avg_xl < 0) avg_xl = 0;
+	if(avg_xr > width) avg_xr = width;
+	
+	
+	if(left_avg_y < mid_pt.y && right_avg_y < mid_pt.y) {
+		if(mid_pt.x < width/2) {
+			avg_xr = width;
+		} else {
+			avg_xl = 0;
+		}
+	}
+	
+	bool moseori = false;
+
+	if(left_avg_y < mid_pt.y) { 
+		avg_xl = 0;
+		moseori = true;
+	} else if(right_avg_y < mid_pt.y) {
+		avg_xr = width;
+		moseori = true;
+	}
+
+	int bias = (width/2 - (avg_xl + avg_xr) / 2) * b_ratio;
+	if(moseori == true && mission_flag == BEFORE_THREE_LANE){
+		SteeringServoControl_Write(1800);
+		GoDistance(0.23);
+		SteeringServoControl_Write(1500);
+		GoDistance(0.10);
+		
+		DesireSpeed_Write(DEFAULT_SPEED);
+		mission_flag = THREE_LANE;
+	}
+	angle = 1500 + bias;
+	if (angle <= 1000) angle = 1000;
+	else if (angle >= 2000) angle = 2000;
+
+	if(mission_flag == AFTER_JUDGING_TRAFFIC_LIGHT) {
+		if(traffic_flag == LEFT) {
+			if(angle < 1500) angle = 1500;
+		} else {
+			if(angle > 1500) angle = 1500;
+		}
+	}
+		
+	angle = ((angle + 50) / 100) * 100;
+	if(last_angle != angle) {
+		SteeringServoControl_Write(angle);
+		last_angle = angle;
+	}
+	
+	if(mission_flag == ROTARY) {
+		double avg_angle = (abs(left_avg_rad) + abs(right_avg_rad)) / 2;
+		Rotary_out(avg_angle);
+	}
+	else if(mission_check[HILL] == false && mission_flag == NOTHING) {
+		double avg_rad = 0.0;
+		if(cnt_rad) avg_rad = sum_rad / cnt_rad;
+		printf("framecnt:%d, avg_rad = %.3lf, Distance=%.3lf\n", frame_cnt, avg_rad, Distance_Channel(FRONT));
+		if(avg_rad <= 1.2 && avg_rad >= 0.65 && mission_flag == NOTHING /*&& Distance_Channel(FRONT) < 0.50f*/) 	
+		{
+			mission_flag = HILL;
+			DesireSpeed_Write(100);
+			hill_state = BEFORE_HILL;
+			Winker_Write(ALL_ON);
+		}
+	}
+
+	if(mission_flag != ROTARY && mission_flag != HILL) {
+		Line_stop();
+	}
+}
+
+CvSeq* Hough_transform(IplImage *img)
+{
+	CvMemStorage *storage = cvCreateMemStorage(0);
+	CvSeq *lines = 0;
+
+	lines = cvHoughLines2(img, storage, CV_HOUGH_PROBABILISTIC, 5, CV_PI / 180, 80, 30, nParam2);
+
+	return lines;
+}
+
+void Canny_tracing()
+{	
+	int i ;
+
+	if(mission_flag != ROTARY) Line_stop();
+	
+	cvCanny(imgOrigin, imgCanny, 100, 100, 3);
+	CvSeq *lines = Hough_transform(imgCanny);
+	
+	CvPoint *line;
+	CvPoint pt1, pt2;
+
+	int left_line_cnt = 0, right_line_cnt = 0;
+	double avg_xl = 0, avg_xr = width, sum_xl = 0, sum_xr = 0;
+	int cnt_rad = 0; double sum_rad = 0;
+	
+	for (i = 0; i<lines->total; i++) {
+		line = (CvPoint*)cvGetSeqElem(lines, i);
+
+		pt1 = line[0];
+		pt2 = line[1];
+
+		double rad = atan2((double)pt2.y - pt1.y, (double)pt2.x - pt1.x);
+		
+	    
+	  if(abs(rad) >= 0.2) {
+			int by = (pt1.y > pt2.y)? pt1.y : pt2.y;
+			if (pt1.y != pt2.y && by >= yl) {
+				double xl = pt1.x + (cut_y - pt1.y)*(pt2.x - pt1.x) / (double)(pt2.y - pt1.y);
+				double xb = pt1.x + (bot_y - pt1.y)*(pt2.x - pt1.x) / (double)(pt2.y - pt1.y);
+				if (xb < width / 2 && rad < 0 && xl >= 0) {
+					left_line_cnt++;
+					sum_xl += xl;
+				}
+				else if (xb >= width / 2 && rad > 0 && xl < width) {
+					right_line_cnt++;
+					sum_xr += xl;
+				}
+			}
+			cvLine(imgOrigin, cvPoint(pt1.x, pt1.y), cvPoint(pt2.x, pt2.y), CV_RGB(0, 0, 255), 1, 8, 0);
+		} else cvLine(imgOrigin, cvPoint(pt1.x, pt1.y), cvPoint(pt2.x, pt2.y), CV_RGB(255, 0, 0), 1, 8, 0);
+	}
+
+	if(left_line_cnt) {
+		avg_xl = sum_xl / left_line_cnt;
+		
+	}
+	if(right_line_cnt) {
+		avg_xr = sum_xr / right_line_cnt;
+		
+	}		
+	
+	int bias = (width/2 - (avg_xl + avg_xr) / 2) * 13.0f;
+	angle = 1500 + bias;
+	if (angle <= 1000) angle = 1000;
+	else if (angle >= 2000) angle = 2000;
+
+	angle = ((angle + 50) / 100) * 100;
+	if(last_angle != angle) {
+		SteeringServoControl_Write(angle);
+		last_angle = angle;
+	}
+}
+
+
+int biasf(double left, double right)
+{
+	int bias = (left + right) * 750;
+	if(bias > 500) bias = 500;
+	else if(bias < -500) bias = -500;
+	return bias;
+}
+
+void Hill_tracing()
+{
+	int i, j;
+	
+	for (i = 0; i<height; i++) {
+		for (j = 0; j<width; j++) {
+			imgYellow->imageData[i*width + j] = (data[3*i*width + 3*j] / (double)(data[3*i*width + 3*j] + data[3*i*width + 3*j + 1] + data[3*i*width + 3*j + 2]) < 0.20) ? 255 : 0;
+		}
+	}
+
+	CvMemStorage *storage = cvCreateMemStorage(0);
+	CvSeq *lines = 0;
+
+	lines = cvHoughLines2(imgYellow, storage, CV_HOUGH_PROBABILISTIC, 5, CV_PI / 180, nThreshold, nParam1, nParam2);
+
+	double rad;
+	CvPoint *line;
+	CvPoint pt1, pt2;
+
+	int cnt_right = 0, cnt_left = 0;
+	double sum_rad_right = 0, sum_rad_left = 0;
+	
+	double rad_left = -1.0, rad_right = 1.0;
+
+	for (i = 0; i<lines->total; i++) {
+		line = (CvPoint*)cvGetSeqElem(lines, i);
+
+		pt1 = line[0];
+		pt2 = line[1];
+
+		rad = atan2((double)pt2.y - pt1.y, (double)pt2.x - pt1.x);
+
+	
+		if(pt1.y > pt2.y && pt1.x < width/2) {
+			cvLine(imgOrigin, cvPoint(pt1.x, pt1.y), cvPoint(pt2.x, pt2.y), CV_RGB(255, 0, 0), 1, 8, 0);
+			sum_rad_left += rad;
+			cnt_left++;
+		}
+		else if(pt1.y < pt2.y && pt2.x > width/2) {
+			cvLine(imgOrigin, cvPoint(pt1.x, pt1.y), cvPoint(pt2.x, pt2.y), CV_RGB(255, 0, 0), 1, 8, 0);
+			sum_rad_right += rad;
+			cnt_right++;
+		}
+	}
+	
+	
+	if(cnt_left) rad_left = sum_rad_left / cnt_left;
+	if(cnt_right) rad_right = sum_rad_right / cnt_right; 
+	int bias = biasf(rad_left, rad_right);
+	SteeringServoControl_Write(1500-bias);
+	if(bias > -50 && bias < 50) {
+		SteeringServoControl_Write(1500);
+		DesireSpeed_Write(HILL_BOOSTER_SPEED);
+		hill_tick = EncoderCounter_Read();
+		CarLight_Write(ALL_ON);
+		hill_state = HILL_CLIMBING;
+	}
+}
+
+int out_enco;
+bool is_clockwise = false, out_decision_on = false;
+int angle_sum = 1500, angle_cnt = 1;
+int no_line_enco;
+bool no_line_hold = false;
+
+void Rotary_tracing()
+{
+    int i, j;
+ 
+    for (i = 0; i<height; i++) {
+        for (j = 0; j<width; j++) {
+            imgYellow->imageData[i*width + j] = (data[3*i*width + 3*j] * 1.8 < data[3*i*width + 3*j + 1] && data[3*i*width +3*j] * 1.8 < data[3*i*width + 3*j + 2]) ? 255 : 0;
+        }
+    }
+    CvMemStorage *storage = cvCreateMemStorage(0);
+    CvSeq *lines = 0;
+ 
+    lines = cvHoughLines2(imgYellow, storage, CV_HOUGH_PROBABILISTIC, 1, CV_PI / 180, 50, 40, 5);
+    CvPoint *line;
+    CvPoint pt1, pt2;
+ 
+    int left_line_cnt = 0, right_line_cnt = 0;
+    double avg_xl = 0, avg_xr = width, sum_xl = 0, sum_xr = 0;
+    int cnt_rad = 0; double sum_rad = 0;
+    int left_sum_x = 0, right_sum_x = 0, left_avg_x = 0, right_avg_x = width;
+    int left_sum_y = 0, right_sum_y = 0, left_avg_y = 0, right_avg_y = 0;
+    double left_sum_rad = 0, right_sum_rad = 0, left_avg_rad = 0, right_avg_rad = 0;
+ 
+    for (i = 0; i<lines->total; i++) {
+        line = (CvPoint*)cvGetSeqElem(lines, i);
+ 
+        pt1 = line[0];
+        pt2 = line[1];
+        double rad = atan2((double)pt2.y - pt1.y, (double)pt2.x - pt1.x);
+ 
+        if (abs(rad) >= 0.1) {
+            int by = (pt1.y > pt2.y) ? pt1.y : pt2.y;
+            if (pt1.y != pt2.y && by >= 170) {
+                double xl = pt1.x + (170 - pt1.y)*(pt2.x - pt1.x) / (double)(pt2.y - pt1.y);
+                double xb = pt1.x + (bot_y - pt1.y)*(pt2.x - pt1.x) / (double)(pt2.y - pt1.y);
+                if (rad < 0 && xl >= 0) {
+                    left_line_cnt++;
+                    sum_xl += xl;
+                    left_sum_x += (pt1.x + pt2.x);
+                    left_sum_y += (pt1.y + pt2.y);
+                    left_sum_rad += rad;
+                }
+                else if (rad > 0 && xl < width) {
+                    right_line_cnt++;
+                    sum_xr += xl;
+                    right_sum_x += (pt1.x + pt2.x);
+                    right_sum_y += (pt1.y + pt2.y);
+                    right_sum_rad += rad;
+                }
+            }
+            cvLine(imgOrigin, cvPoint(pt1.x, pt1.y), cvPoint(pt2.x, pt2.y), CV_RGB(0, 0, 255), 1, 8, 0);
+        }
+        else cvLine(imgOrigin, cvPoint(pt1.x, pt1.y), cvPoint(pt2.x, pt2.y), CV_RGB(255, 0, 0), 1, 8, 0);
+    }
+ 
+    if (left_line_cnt >= 2) {
+        avg_xl = sum_xl / left_line_cnt;
+        left_avg_rad = left_sum_rad / left_line_cnt;
+        left_avg_x = left_sum_x / (double)(left_line_cnt * 2) + 0.5;
+        left_avg_y = left_sum_y / (double)(left_line_cnt * 2) + 0.5;
+    }
+    if (right_line_cnt >= 2) {
+        avg_xr = sum_xr / right_line_cnt;
+        right_avg_rad = right_sum_rad / right_line_cnt;
+        right_avg_x = right_sum_x / (double)(right_line_cnt * 2) + 0.5;
+        right_avg_y = right_sum_y / (double)(right_line_cnt * 2) + 0.5;
+    }
+ 
+   
+    CvPoint mid_pt;
+    mid_pt.x = width / 2; mid_pt.y = 0;
+    if (left_line_cnt >= 2 && right_line_cnt >= 2) {
+        mid_pt = mPoint(cvPoint(left_avg_x, left_avg_y), left_avg_rad, cvPoint(right_avg_x, right_avg_y), right_avg_rad);
+    }
+    if (left_avg_y < mid_pt.y && right_avg_y < mid_pt.y) {
+        if (mid_pt.x < width / 2) {
+            avg_xr = width;
+        }
+        else {
+            avg_xl = 0;
+        }
+ 
+        if (out_decision_on) {
+            rotary_state = 2;
+            out_decision_on = false;
+            out_enco = EncoderCounter_Read();
+        }
+    }
+    else if (left_avg_y < mid_pt.y) {
+        avg_xl = 0;
+    }
+    else if (right_avg_y < mid_pt.y) {
+        avg_xr = width;
+    }
+    if(rotary_state < 2) {
+		if(out_decision_on && left_line_cnt == 0 && right_line_cnt == 0) {
+			if(!no_line_hold) {
+				no_line_hold = true;
+				EncoderCounter_Write(0);
+				no_line_enco = EncoderCounter_Read();
+			}
+		} else if(out_decision_on) {
+			if(no_line_hold) {
+				int no_line_dist = EncoderCounter_Read() - no_line_enco;
+				printf("no_line_dist = %d\n", no_line_dist);
+				if(no_line_dist > (0.15 * TICK_PER_METER)) {
+					rotary_state = 2;
+					out_decision_on = false;
+				}
+				else {
+					no_line_hold = false;
+				}
+			}
+		}
+	}
+    
+    if (EncoderCounter_Read() - rotary_start_enco >= 1.5f * TICK_PER_METER && !out_decision_on) {
+        out_decision_on = true;
+        if (angle_sum / angle_cnt >= 1500) {
+            is_clockwise = false;
+        }
+        else {
+            is_clockwise = true;
+        }
+    }
+ 
+    if (rotary_state == 2) {
+        if (is_clockwise) avg_xr = width;
+        else avg_xl = 0;
+    }
+ 
+    int bias = (width / 2 - (avg_xl + avg_xr) / 2) * 8.0;
+    angle = 1500 + bias;
+    if (angle <= 1000) angle = 1000;
+    else if (angle >= 2000) angle = 2000;
+ 
+    angle = ((angle + 50) / 100) * 100;
+    if (last_angle != angle) {
+        SteeringServoControl_Write(angle);
+        last_angle = angle;
+ 
+        if(!out_decision_on) {angle_sum += angle; angle_cnt++;} 
+    }
+ 
+}
+
+
+void Hill_driving()
+{
+	if(hill_state == BEFORE_HILL) {
+		Hill_tracing();
+	}
+	else if(hill_state == HILL_CLIMBING && EncoderCounter_Read() - hill_tick >= 1.2f * TICK_PER_METER) {
+		DesireSpeed_Write(70);
+		CarLight_Write(ALL_OFF);
+		hill_tick = EncoderCounter_Read();
+		hill_state = HILL_DESCENDING;
+	}
+	else if(hill_state == HILL_DESCENDING) {
+		if(EncoderCounter_Read() - hill_tick < 0.5f * TICK_PER_METER) {
+			Line_tracing();
+		} else {
+			DesireSpeed_Write(DEFAULT_SPEED);
+			hill_state = HILL_END;
+			mission_flag = NOTHING;
+			mission_check[HILL] = true;
+			Winker_Write(ALL_OFF);
+			flag_cnt++;
+		}
+	}
+}
+int rotary_enco=0;
+int rotary_enco2=0;
+void GoDistance2(float distance, int speed)
+{
+	int temp_tick = EncoderCounter_Read();
+	if(distance >= 0) {
+		DesireSpeed_Write(speed);
+		while((EncoderCounter_Read() - temp_tick) < (int)(distance*TICK_PER_METER)) {
+			printf("EncoderCounter_Read=%d\n", (int)(EncoderCounter_Read()*METER_PER_TICK));
+		}
+	}
+	else if(distance < 0) {
+		DesireSpeed_Write(-speed);
+		while((EncoderCounter_Read() - temp_tick) > (int)(distance*TICK_PER_METER)) {
+			printf("EncoderCounter_Read=%d\n", (int)(EncoderCounter_Read()*METER_PER_TICK));			
+		}
+	}
+	DesireSpeed_Write(0);
+}
+bool backup_flag = false;
+void Rotary_driving()
+{
+    if (rotary_state == 0) {
+        if (Distance_Channel(FRONT) >= 0.35f && Distance_Channel(FRONT) < 0.45f) {      	
+            rotary_state = 1;
+            EncoderCounter_Write(0);
+            rotary_enco = EncoderCounter_Read();
+            DesireSpeed_Write(ROTARY_SPEED);
+            
+        }
+    }
+
+    
+    else if (rotary_state == 1) {
+	      int rotary_enco_end = EncoderCounter_Read();
+        if (rotary_enco_end - rotary_enco <= (0.5f * TICK_PER_METER) && !backup_flag){
+        	rotary_enco2 = EncoderCounter_Read();
+        	if(Distance_Channel(LEFT_FRONT) >= 0.0f && Distance_Channel(LEFT_FRONT) <= 0.2f && !backup_flag)	{
+        		GoDistance2(-0.15f,200);
+        		sleep(2);
+        		DesireSpeed_Write(50);
+        		backup_flag = true;
+        	}
+        	else if(Distance_Channel(LEFT_REAR) >= 0.0f && Distance_Channel(LEFT_REAR)<=0.2f && !backup_flag){
+        		GoDistance2(0.1f,200);
+        		backup_flag = true;
+        		DesireSpeed_Write(ROTARY_SPEED);
+          	}
+        }
+        else{	 
+		    if ((Distance_Channel(FRONT) <= 0.20f) || ((Distance_Channel(LEFT_FRONT) >= 0.0f) && (Distance_Channel(LEFT_FRONT) <= 0.10f)))
+		        DesireSpeed_Write(0);
+		    else if (Distance_Channel(REAR) <= 0.25f) DesireSpeed_Write(100);
+		    else DesireSpeed_Write(ROTARY_SPEED);
+        }
+        
+    }
+    else if (rotary_state == 2) { 
+        if (EncoderCounter_Read() - out_enco >= 0.3f * TICK_PER_METER) {
+            rotary_state = 3;
+        }
+    }
+    else if (rotary_state == 3) {
+        DesireSpeed_Write(DEFAULT_SPEED);
+        mission_flag = NOTHING;
+        mission_check[ROTARY] = true;
+        line_stop_on = true;
+        flag_cnt++;
+    }
+}
+
+int get_blue(int i, int j)
+{
+	return data[3*i*width + 3*j];
+}
+
+int get_green(int i, int j)
+{
+	return data[3*i*width + 3*j + 1];
+}
+
+int get_red(int i, int j)
+{
+	return data[3*i*width + 3*j + 2];
+}
+
+int ready_to_go;
+int cnt_right = 0, cnt_left = 0;
+void Traffic_light()
+{
+	Refresh_BW(75);
+	CvMemStorage* storage = cvCreateMemStorage(0);
+	CvSeq* Circles = cvHoughCircles(imgBi, storage, CV_HOUGH_GRADIENT, 1, 20, 170, 10, 6, 20);
+	int np = Circles->total;
+	int i, j, k;
+	
+	for(k = 0; k < np; k++) {
+		float* circle = (float*)cvGetSeqElem(Circles, k);
+		
+		CvPoint pt = cvPoint(cvRound(circle[0]), cvRound(circle[1]));
+		int radius = cvRound(circle[2]);
+		cvCircle(imgOrigin, cvPoint(cvRound(circle[0]), cvRound(circle[1])), cvRound(circle[2]), CV_RGB(255, 0, 0), 3, 8, 0);
+		
+		int green_detect = 0, not_green_detect = 0, yellow_detect = 0;
+		
+		for(i=pt.y-(radius/1.414); i<pt.y+(radius/1.414); i++){
+			for(j=pt.x-(radius/1.414); j<pt.x+(radius/1.414); j++){
+				if(i >= 0 && j >= 0 && i < height && j < width) {
+					if((get_red(i,j) > 1.8 * get_blue(i,j)) && (get_green(i,j) > 1.8 * get_blue(i,j))){
+						yellow_detect ++;
+					}
+					else if(get_green(i,j)/(float)(get_blue(i,j)+get_green(i,j)+get_red(i,j)) > 0.4){
+						green_detect ++;
+					}
+					else not_green_detect ++;
+				}
+			}
+		}
+		
+		double green_ratio = green_detect / (double)(green_detect + not_green_detect);
+		
+		if(green_ratio > 0.6) {
+			cnt_right++;
+		} else if(green_ratio < 0.55 && green_ratio > 0.3) {
+			cnt_left++;
+		}
+		
+	}
+	
+ 
+    if(cnt_right >= 10){
+        traffic_flag = RIGHT;
+        mission_flag = AFTER_JUDGING_TRAFFIC_LIGHT;
+        CameraYServoControl_Write(1700);
+        DesireSpeed_Write(DEFAULT_SPEED);
+    }
+    else if(cnt_left >= 10){
+		traffic_flag = LEFT;
+        mission_flag = AFTER_JUDGING_TRAFFIC_LIGHT;
+        CameraYServoControl_Write(1700);
+        DesireSpeed_Write(DEFAULT_SPEED);
+    }
+}
+
+void Initializing()
+{
+	CarControlInit();
+	Parking_Init();
+    CameraYServoControl_Write(1500);
+    sleep(1);
+    CameraXServoControl_Write(1500);
+    SteeringServoControl_Write(STEERING_CENTER);
+    DesireSpeed_Write(0);
+    Winker_Write(ALL_ON);
+    sleep(1);
+    Winker_Write(ALL_OFF);
+    Alarm_Write(OFF);
+}
+
+void Refresh_canny()
+{
+	cvCanny(imgOrigin, imgCanny, 100, 100, 3);
+}
+
+bool end_flag = false, before_light_enco_flag = false;
+int before_light_enco;
+void After_traffic()
+{
+	Refresh_canny();
+	switch(final_tracing_state){
+		case BEFORE_LIGHT:
+				GoDistance(0.30);
+				line_stop_on = true;
+				if(traffic_flag == RIGHT) {
+					SteeringServoControl_Write(1000);
+					GoDistance(0.35);
+				}
+		        else {
+		        	SteeringServoControl_Write(2000);
+		        	GoDistance(0.40);
+		        }
+		        SteeringServoControl_Write(STEERING_CENTER);
+		        DesireSpeed_Write(DEFAULT_SPEED);
+		        final_tracing_state ++;
+		    	Line_tracing();
+		    break;
+		case AFTER_LIGHT:
+		    Line_tracing();
+		    break;
+		case STOP_AREA:
+		    SteeringServoControl_Write(STEERING_CENTER);
+		    GoDistance(0.3);
+		    Alarm_Write(ON);
+		    sleep(1);
+		    Alarm_Write(OFF);
+		    end_flag = true;
+		    break;
+    }
+}
+
+
+void Final_tracing()
+{	
+	if(traffic_flag == RIGHT) {
+		SteeringServoControl_Write(1050);
+	} else {
+		SteeringServoControl_Write(1950);
+	}
+	
+	sleep(1);
+	GoDistance(0.4);
+	CameraYServoControl_Write(1700);
+	SteeringServoControl_Write(1500);
+	sleep(1);
+	GoDistance(0.4);
+	end_flag = true;
+}
+
+
+void *ControlThread(void *unused) 
+{
+
+	bool start_flag = false; 
+	bool tracing_flag = false; 
+    imgOrigin = cvCreateImage(cvSize(RESIZE_WIDTH, RESIZE_HEIGHT), IPL_DEPTH_8U, 3);
+    data = (uchar *)imgOrigin->imageData;
+    imgCanny = cvCreateImage(cvSize(RESIZE_WIDTH, RESIZE_HEIGHT), IPL_DEPTH_8U, 1);
+    imgBW = cvCreateImage(cvSize(RESIZE_WIDTH, RESIZE_HEIGHT), IPL_DEPTH_8U, 1);
+    imgGray = cvCreateImage(cvSize(RESIZE_WIDTH, RESIZE_HEIGHT), IPL_DEPTH_8U, 1);
+    imgBi = cvCreateImage(cvSize(RESIZE_WIDTH, RESIZE_HEIGHT), IPL_DEPTH_8U, 1);
+    imgPrev = cvCreateImage(cvSize(RESIZE_WIDTH, RESIZE_HEIGHT), IPL_DEPTH_8U, 1); 
+    imgSub = cvCreateImage(cvSize(RESIZE_WIDTH, RESIZE_HEIGHT), IPL_DEPTH_8U, 1); 
+	  imgYellow = cvCreateImage(cvSize(RESIZE_WIDTH, RESIZE_HEIGHT), IPL_DEPTH_8U, 1);
+	 
+    Initializing();
+
+    int i, j;
+    int white_cnt = 0;
+    
+    int adc_data = 0;
+    int pre_angle;
+	float distance = 0;
+	i = 0;
+	mission_flag = NOTHING;
+   
+
+    while(1)
+    {
+        pthread_mutex_lock(&mutex);
+        pthread_cond_wait(&cond, &mutex);
+  
+        Frame2Ipl(imgOrigin); 
+        pthread_mutex_unlock(&mutex);
+        
+          		        
+		if(start_flag == false) { 
+			if(Waiting_start_sign()) {
+				Starting();
+				start_flag = true;
+				GoDistance(0.15);
+				DesireSpeed_Write(DEFAULT_SPEED);
+				tracing_flag = true;
+			
+			}   
+		}
+		else 
+		{
+			if(end_flag) return;
+			printf("mission:%d\n",mission_flag);
+			switch (mission_flag) {
+			case NOTHING:
+				Line_stop();
+				line_stop_on = true;
+
+				if(!mission_check[EMERG_STOP]) Emergency_stop();
+				Line_tracing();
+				Parking_Place_Detecting(); 
+				
+				if(flag_cnt == NUM_OF_MISSION) {Three_lane_detect();mission_flag = BEFORE_THREE_LANE;}
+				break;
+			case HILL:
+			
+				Hill_driving();
+				if(hill_state == HILL_END) mission_flag = NOTHING;
+				break;
+			case ROTARY:
+				Rotary_tracing();
+				Rotary_driving();
+				break;
+			case BEFORE_THREE_LANE:
+				Line_tracing();
+				
+				
+				if(lane_end > 1) yellow_flag = 1;
+			
+				if(yellow_flag == 1){
+					SteeringServoControl_Write(1500);
+		
+					GoDistance(-0.35f);
+					SteeringServoControl_Write(1900);
+					usleep(300000);
+					GoDistance(0.42f);
+					SteeringServoControl_Write(1100);    
+					usleep(300000);
+					GoDistance(0.20f);
+					DesireSpeed_Write(DEFAULT_SPEED);
+					mission_flag = BEFORE_TRAFFIC_LIGHT;
+					mission_check[THREE_LANE] = true;
+					flag_cnt++;	
+				}
+				
+				break;
+			case THREE_LANE: 
+				Line_stop();
+				Canny_tracing();
+				Line_tracing();
+				
+				if(obstacle_flag == 1){
+					Three_lane_driving();
+				}
+				else Three_lane_detect();
+				break;
+			case BEFORE_TRAFFIC_LIGHT:
+				Line_tracing();
+				
+				break;
+			case TRAFFIC_LIGHT:
+				Traffic_light();
+				break;
+			case AFTER_JUDGING_TRAFFIC_LIGHT:
+				After_traffic();
+				break;
+			}
+		}
+		frame_cnt++; 
+	} 
+}
+
+enum {
+	obstacle,
+	yellow_check
+} Three_lane_state = obstacle;
+
+
+
+#define left 1
+#define right 2
+int lane = 0;
+int right_gray = 0;
+int left_gray = 0;
+void Three_lane_driving(void)
+{	
+	if(Three_lane_state == obstacle){
+		SteeringServoControl_Write(1500);
+		GoDistance(-0.20f);
+		
+			SteeringServoControl_Write(1100);
+			usleep(300000);
+			GoDistance(0.28f);
+			SteeringServoControl_Write(1500);    
+		
+			lane = right;	
+			Three_lane_state = yellow_check;
+
+		DesireSpeed_Write(DEFAULT_SPEED);					
+	}
+	else if(Three_lane_state == yellow_check){
+		int i, j;
+		
+		if(yellow_flag == 0){
+			
+			Canny_tracing();
+			Line_tracing();
+
+			
+			if(lane_end > 1) yellow_flag = 1;
+			
+		}
+		else if(yellow_flag == 1){
+			if(lane == right){
+				SteeringServoControl_Write(1500);
+				
+				GoDistance(-0.30f);
+				SteeringServoControl_Write(1900);
+				usleep(300000);
+				GoDistance(0.45f);
+				SteeringServoControl_Write(1100);    
+				usleep(300000);
+				GoDistance(0.20f);
+			}
+			else if(lane == left){
+				SteeringServoControl_Write(1500);
+				GoDistance(-0.30f);
+				SteeringServoControl_Write(1100);
+				usleep(300000);
+				GoDistance(0.45f);
+				SteeringServoControl_Write(1900);    
+				usleep(300000);
+				GoDistance(0.25f);
+			}
+			DesireSpeed_Write(DEFAULT_SPEED);
+			mission_flag = BEFORE_TRAFFIC_LIGHT;
+			mission_check[THREE_LANE] = true;
+			flag_cnt++;	
+		}	
+	}
+}	
+
+void Right_steering(){		
+	SteeringServoControl_Write(1000);
+	usleep(300000);
+	GoDistance(0.40f);
+	
+}
+void left_steering(){	
+	SteeringServoControl_Write(2000); 
+	usleep(300000);
+	GoDistance(0.40f);
+}
+int ready2stop, ready2go;
+bool is_stopped;
+int Emergency_stop()
+{
+    if(mission_flag != HILL) Line_stop();
+ 	
+    int emerg_red = 0, not_red = 0, i, j;
+ 
+    for (i = 0; i < height / 3; i++) {
+        for (j = 0; j < width; j++) {
+            if (get_red(i, j) / (float)(get_blue(i, j) + get_green(i, j) + get_red(i, j)) > 0.4) emerg_red++;
+            else not_red++;
+        }
+    }
+ 
+    printf("emerg_red : %d\n" , emerg_red);
+    if (emerg_red > 2800) {
+        ready2stop++;
+        ready2go = 0;
+    }
+    else {
+        ready2go++;
+        ready2stop = 0;
+    }
+     
+    if (!is_stopped && ready2stop >= 1) {
+        DesireSpeed_Write(0);
+        is_stopped = true;
+        return  1;
+    }
+    else if (is_stopped && ready2go >= 2) {
+        sleep(1);
+        DesireSpeed_Write(DEFAULT_SPEED);
+        is_stopped = false;
+        mission_flag = NOTHING;
+        mission_check[EMERG_STOP] = true;
+        flag_cnt++;
+        return 0;
+    }
+}
